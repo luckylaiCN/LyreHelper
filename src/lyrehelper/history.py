@@ -11,7 +11,7 @@ from pathlib import Path
 import mido
 import numpy as np
 
-from .analysis import update_performance_score
+from .analysis import chord_function, tempo_standard_deviation, update_performance_score
 from .models import (
     AnalysisSnapshot,
     BeatMarker,
@@ -83,6 +83,7 @@ def _load_chords(path: Path | None) -> tuple[list[ChordSegment], list[KeySegment
                         float(row["end_time"]),
                         row["chord_name"],
                         row["key"],
+                        chord_function(row["chord_name"], row["key"]),
                     )
                 )
     except (OSError, KeyError, TypeError, ValueError):
@@ -149,7 +150,7 @@ def load_history_snapshot(entry: HistoryEntry) -> AnalysisSnapshot:
     chords, keys = _load_chords(entry.chord_path)
     bpms = np.asarray([point.bpm for point in tempo_points], dtype=float)
     average = float(bpms.mean()) if len(bpms) else 0.0
-    deviation = float(bpms.std()) if len(bpms) else 0.0
+    deviation = tempo_standard_deviation(tempo_points)
     snapshot = AnalysisSnapshot(
         state=MonitorState.STANDBY,
         device_name="Archived session",

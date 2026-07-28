@@ -22,3 +22,4 @@ def test_history_restores_archived_audio_notes_and_tempo(tmp_path) -> None:
     assert [round(point.bpm) for point in snapshot.tempo] == [120, 123]
     assert [(note.midi_note, note.velocity) for note in snapshot.notes] == [(60, 96)]
     assert snapshot.chords[0].chord == "C"
+    assert snapshot.chords[0].function == "I"

@@ -67,6 +67,25 @@ def _session() -> object | None:
         return None
 
 
+def transcription_execution_device() -> tuple[str, bool]:
+    """Return the active inference-device label and whether it is accelerated."""
+    session = _session()
+    if session is None:
+        return "CPU · FALLBACK", False
+    provider = str(session.get_providers()[0])
+    labels = {
+        "CUDAExecutionProvider": ("GPU · CUDA", True),
+        "DmlExecutionProvider": ("GPU · DIRECTML", True),
+        "CoreMLExecutionProvider": ("ACCEL · COREML", True),
+        "CPUExecutionProvider": ("CPU", False),
+    }
+    return labels.get(provider, (provider.removesuffix("ExecutionProvider").upper(), False))
+
+
+def transcription_runtime_available() -> bool:
+    return _session() is not None
+
+
 def _model_output(audio: np.ndarray, sample_rate: int) -> tuple[np.ndarray, np.ndarray] | None:
     session = _session()
     if session is None:

@@ -341,7 +341,7 @@ def _feature_row(
         "within_10ms_pct": f"{within_10ms:.1f}",
         "window_median_error_ms": f"{(local_error_ms or 0.0):.2f}",
         "bpm_high_frequency_std": f"{high_frequency_std:.3f}",
-        "timing_rebuild": "incremental-current",
+        "timing_rebuild": "midi-note-window-simulation",
         "user_label_source": source,
     }, cache_hit
 

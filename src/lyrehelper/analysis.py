@@ -25,6 +25,10 @@ NOTE_BINS = 72  # C2-B7
 PITCH_NAMES = ("C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B")
 MAJOR_PROFILE = np.array([6.35, 2.23, 3.48, 2.33, 4.38, 4.09, 2.52, 5.19, 2.39, 3.66, 2.29, 2.88])
 MINOR_PROFILE = np.array([6.33, 2.68, 3.52, 5.38, 2.60, 3.53, 2.54, 4.75, 3.98, 2.69, 3.34, 3.17])
+TEMPO_JUMP_MIN_BPM = 8.0
+TEMPO_JUMP_RATIO = 0.08
+TEMPO_STATS_MIN_SEGMENT_SECONDS = 10.0
+TEMPO_HUMAN_STD_RELATIVE_SCALE = 0.045
 
 
 @dataclass(frozen=True, slots=True)
@@ -190,6 +194,11 @@ def _constant_tempo_fit(
             residuals = np.abs(onset_times - (origin + indices * nominal_step))
             inliers = residuals <= 0.032
             count = int(np.count_nonzero(inliers))
+            # A candidate with fewer inliers cannot win, so avoid allocating and
+            # reducing its residual array. This loop runs for every incremental
+            # timing refresh even when the tempo is plainly non-constant.
+            if count < best_score[0]:
+                continue
             score = (count, -float(np.median(residuals[inliers])) if count else -1.0)
             if score > best_score:
                 best_score = score
@@ -266,6 +275,60 @@ def _repeated_tempo_levels(estimates: list[float], reference_bpm: float) -> list
     if len(repeated) != 2:
         return []
     return [float(np.median(cluster)) for cluster in repeated]
+
+
+def _tempo_jump_segments(
+    points: list[TempoPoint],
+    jump_bpm: float = TEMPO_JUMP_MIN_BPM,
+    jump_ratio: float = TEMPO_JUMP_RATIO,
+) -> list[list[TempoPoint]]:
+    if not points:
+        return []
+    ordered = sorted(points, key=lambda point: point.time)
+    segments: list[list[TempoPoint]] = [[ordered[0]]]
+    for point in ordered[1:]:
+        previous = segments[-1][-1]
+        reference = min(abs(previous.bpm), abs(point.bpm))
+        threshold = max(jump_bpm, reference * jump_ratio)
+        if abs(point.bpm - previous.bpm) >= threshold:
+            segments.append([point])
+        else:
+            segments[-1].append(point)
+    return segments
+
+
+def _tempo_segment_duration(points: list[TempoPoint]) -> float:
+    if len(points) < 2:
+        return 0.0
+    times = np.asarray([point.time for point in points], dtype=float)
+    spacing = np.diff(times)
+    spacing = spacing[spacing > 1e-6]
+    step = float(np.median(spacing)) if len(spacing) else 0.0
+    return max(0.0, float(times[-1] - times[0]) + step)
+
+
+def tempo_standard_deviation(
+    points: list[TempoPoint],
+    min_segment_seconds: float = TEMPO_STATS_MIN_SEGMENT_SECONDS,
+) -> float:
+    """Pool within-segment BPM variance without treating tempo changes as jitter."""
+    weighted_variance = 0.0
+    total_weight = 0.0
+    segments = _tempo_jump_segments(points)
+    has_confirmed_jump = len(segments) > 1
+    for segment in segments:
+        duration = _tempo_segment_duration(segment)
+        if has_confirmed_jump and duration < min_segment_seconds:
+            continue
+        values = np.asarray([point.bpm for point in segment], dtype=float)
+        values = values[np.isfinite(values)]
+        if not len(values):
+            continue
+        weighted_variance += duration * float(np.var(values))
+        total_weight += duration
+    if total_weight <= 1e-9:
+        return 0.0
+    return float(np.sqrt(max(0.0, weighted_variance / total_weight)))
 
 
 def _tempo_track(
@@ -514,7 +577,19 @@ def _timing_grid_errors(
             onset_groups[-1].append(start)
         else:
             onset_groups.append([start])
-    onset_times = np.asarray([float(np.median(group)) for group in onset_groups], dtype=float)
+    # ``onset_groups`` is built from globally sorted starts.  Avoid a NumPy
+    # median allocation for every mostly-singleton group; this is on the hot
+    # path of every incremental score update and the direct order statistic is
+    # mathematically identical for an already sorted group.
+    onset_times = np.asarray(
+        [
+            float(group[len(group) // 2])
+            if len(group) % 2
+            else float((group[len(group) // 2 - 1] + group[len(group) // 2]) / 2.0)
+            for group in onset_groups
+        ],
+        dtype=float,
+    )
     if len(onset_times) < 8:
         return beat_times, np.array([], dtype=float), np.array([], dtype=float)
     phases = np.asarray((0.0, 0.25, 1.0 / 3.0, 0.5, 2.0 / 3.0, 0.75, 1.0))
@@ -584,9 +659,10 @@ def _combine_mechanical_evidence(
     local_grid_mechanical: float,
     tempo_mechanical: float,
 ) -> float:
-    # Precise local timing is necessary but not sufficient. It must be corroborated by
-    # either a precise global grid or stable tempo before the result is called mechanical.
-    return min(local_grid_mechanical, max(grid_mechanical, tempo_mechanical))
+    # In monophonic material the beat grid and its local error are fitted from the same
+    # note starts, so they are one evidence family rather than two independent votes.
+    # A mechanical result requires that fitted grid to be precise *and* tempo to be stable.
+    return min(max(grid_mechanical, local_grid_mechanical), tempo_mechanical)
 
 
 def _chord_onset_mechanical_evidence(notes: list[NoteEvent]) -> float | None:
@@ -641,14 +717,20 @@ def _chord_articulation_dynamics(
     for group in onset_groups:
         if len(group) < 2:
             continue
-        group_time = float(np.median([note.start for note in group]))
+        starts = sorted(note.start for note in group)
+        middle = len(starts) // 2
+        group_time = (
+            float(starts[middle])
+            if len(starts) % 2
+            else float((starts[middle - 1] + starts[middle]) / 2.0)
+        )
         beat_index = int(np.searchsorted(beat_times, group_time, side="right") - 1)
         if beat_index < 0 or beat_index + 1 >= len(beat_times):
             continue
         period = beat_times[beat_index + 1] - beat_times[beat_index]
         if not 0.2 <= period <= 2.0:
             continue
-        starts = np.asarray([note.start for note in group], dtype=float)
+        starts = np.asarray(starts, dtype=float)
         normalized_spreads.append(float(np.ptp(starts) / period))
         ordered = sorted(group, key=lambda note: note.midi_note)
         for left_index, left in enumerate(ordered[:-1]):
@@ -773,6 +855,8 @@ def _calibrated_human_score(
 
 
 def update_performance_score(result: AnalysisResult | AnalysisSnapshot) -> None:
+    if result.tempo:
+        result.bpm_std = tempo_standard_deviation(result.tempo)
     coefficient = result.bpm_std / max(result.average_bpm, 1.0)
     values = np.asarray([point.bpm for point in result.tempo], dtype=float)
     autocorrelation = (
@@ -782,7 +866,13 @@ def update_performance_score(result: AnalysisResult | AnalysisSnapshot) -> None:
     )
     pattern = float(np.nan_to_num(abs(autocorrelation), nan=0.0))
     tempo_human = float(
-        np.clip(100.0 * (coefficient / 0.045) * (0.65 + 0.35 * pattern), 0.0, 100.0)
+        np.clip(
+            100.0
+            * (coefficient / TEMPO_HUMAN_STD_RELATIVE_SCALE)
+            * (0.65 + 0.35 * pattern),
+            0.0,
+            100.0,
+        )
     )
     grid_accuracy, timing_deviation_ms, local_error_ms = _timing_grid_statistics(
         result.notes, result.beats
@@ -851,17 +941,55 @@ def _key_segments(chroma: np.ndarray, frame_rate: float) -> list[KeySegment]:
         raw.append((start / frame_rate, key, confidence))
     if not raw:
         return []
+    global_key, global_confidence, _, _ = _detect_key(chroma.mean(axis=0))
+    initial = max(raw[: min(3, len(raw))], key=lambda item: item[2])
+    current_key = initial[1] if initial[2] >= 0.04 else global_key
+    if current_key == "Unknown":
+        current_key = global_key
     merged: list[KeySegment] = []
-    current_start, current_key, confidences = raw[0][0], raw[0][1], [raw[0][2]]
-    for start, key, confidence in raw[1:]:
-        if key != current_key and confidence >= 0.06:
-            merged.append(KeySegment(current_start, start, current_key, float(np.mean(confidences))))
-            current_start, current_key, confidences = start, key, [confidence]
-        else:
+    current_start = 0.0
+    confidences: list[float] = []
+    pending_key: str | None = None
+    pending_start = 0.0
+    pending_confidences: list[float] = []
+    for start, key, confidence in raw:
+        observed = key if key != "Unknown" and confidence >= 0.04 else current_key
+        if observed == current_key:
             confidences.append(confidence)
+            pending_key = None
+            pending_confidences.clear()
+            continue
+        if observed == pending_key:
+            pending_confidences.append(confidence)
+        else:
+            pending_key = observed
+            pending_start = start
+            pending_confidences = [confidence]
+        if len(pending_confidences) < 2 or float(np.mean(pending_confidences)) < 0.06:
+            continue
+        merged.append(
+            KeySegment(
+                current_start,
+                pending_start,
+                current_key,
+                float(np.mean(confidences)) if confidences else global_confidence,
+            )
+        )
+        current_start = pending_start
+        current_key = observed
+        confidences = list(pending_confidences)
+        pending_key = None
+        pending_confidences.clear()
     duration = len(chroma) / frame_rate
-    merged.append(KeySegment(current_start, duration, current_key, float(np.mean(confidences))))
-    return merged
+    merged.append(
+        KeySegment(
+            current_start,
+            duration,
+            current_key,
+            float(np.mean(confidences)) if confidences else global_confidence,
+        )
+    )
+    return [item for item in merged if item.end > item.start]
 
 
 def _key_at(time: float, keys: list[KeySegment]) -> tuple[str, int, bool]:
@@ -882,8 +1010,28 @@ def _roman_function(root: int, key_root: int, major: bool, chord: str) -> str:
     return base
 
 
+def chord_function(chord: str, key: str) -> str:
+    """Recover a functional label from the exported chord and key names."""
+    if chord == "N" or key == "Unknown":
+        return ""
+    try:
+        key_name, quality = key.split(" ", 1)
+        root_name = chord[:2] if len(chord) > 1 and chord[1] == "#" else chord[:1]
+        return _roman_function(
+            PITCH_NAMES.index(root_name),
+            PITCH_NAMES.index(key_name),
+            quality == "major",
+            chord,
+        )
+    except (ValueError, IndexError):
+        return ""
+
+
 def _classify_chord(vector: np.ndarray, key_root: int, major: bool) -> tuple[str, int, float]:
     if vector.sum() < 1e-7 or vector.max(initial=0) < 0.14:
+        return "N", 0, 0.0
+    active_threshold = max(0.055, float(vector.max(initial=0.0)) * 0.16)
+    if int(np.count_nonzero(vector >= active_threshold)) < 2:
         return "N", 0, 0.0
     best: tuple[float, str, int] = (-1e9, "N", 0)
     scale = ({0, 2, 4, 5, 7, 9, 11} if major else {0, 2, 3, 5, 7, 8, 10})
@@ -901,7 +1049,18 @@ def _classify_chord(vector: np.ndarray, key_root: int, major: bool) -> tuple[str
     return best[1], best[2], float(np.clip((best[0] + 0.2) / 1.2, 0, 1))
 
 
-def _chord_segments(chroma: np.ndarray, frame_rate: float, keys: list[KeySegment]) -> list[ChordSegment]:
+def _chord_segments(
+    chroma: np.ndarray,
+    frame_rate: float,
+    keys: list[KeySegment],
+    *,
+    harmonic_evidence: bool,
+) -> list[ChordSegment]:
+    if not harmonic_evidence:
+        return [
+            ChordSegment(item.start, item.end, "N", item.key, "", item.confidence)
+            for item in keys
+        ]
     harmonic_window = max(1, int(frame_rate * 1.25))
     hop = max(1, harmonic_window // 2)
     raw: list[ChordSegment] = []
@@ -948,9 +1107,31 @@ def _chord_segments(chroma: np.ndarray, frame_rate: float, keys: list[KeySegment
                 item.function,
                 (previous.confidence + item.confidence) / 2,
             )
-        elif item.chord != "N" or not merged:
+        else:
             merged.append(item)
     return merged
+
+
+def _has_polyphonic_harmony(notes: list[NoteEvent]) -> bool:
+    onset_groups: list[list[NoteEvent]] = []
+    for note in sorted(notes, key=lambda item: item.start):
+        if onset_groups and note.start - onset_groups[-1][0].start <= 0.035:
+            onset_groups[-1].append(note)
+        else:
+            onset_groups.append([note])
+    # Transcription tails often overlap the next monophonic note. Only independent
+    # near-simultaneous attacks are strong enough evidence to infer a chord root.
+    polyphonic_groups = [
+        group
+        for group in onset_groups
+        if len({note.midi_note for note in group}) >= 2
+    ]
+    sustained_triad = any(
+        len({note.midi_note % 12 for note in group}) >= 3
+        and sorted((note.end - note.start for note in group), reverse=True)[1] >= 1.0
+        for group in polyphonic_groups
+    )
+    return sustained_triad or len(polyphonic_groups) >= 4
 
 
 def _analyze_events(
@@ -965,12 +1146,17 @@ def _analyze_events(
     chroma_frame_rate = 8.0
     chroma = _note_chroma(notes, duration, chroma_frame_rate)
     keys = _key_segments(chroma, chroma_frame_rate)
-    chords = _chord_segments(chroma, chroma_frame_rate, keys)
+    chords = _chord_segments(
+        chroma,
+        chroma_frame_rate,
+        keys,
+        harmonic_evidence=_has_polyphonic_harmony(notes),
+    )
     bpms = np.asarray([point.bpm for point in tempo], dtype=float)
     average = float(np.mean(bpms)) if len(bpms) else 0.0
     minimum = float(np.min(bpms)) if len(bpms) else 0.0
     maximum = float(np.max(bpms)) if len(bpms) else 0.0
-    standard_deviation = float(np.std(bpms)) if len(bpms) else 0.0
+    standard_deviation = tempo_standard_deviation(tempo)
     if standard_deviation < 1e-9:
         standard_deviation = 0.0
     if sparse_notes:

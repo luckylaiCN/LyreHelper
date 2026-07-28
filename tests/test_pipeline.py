@@ -4,18 +4,31 @@ import numpy as np
 
 from lyrehelper.config import AppConfig
 from lyrehelper.analysis import update_performance_score
-from lyrehelper.models import AnalysisResult, BeatMarker, MonitorState, NoteEvent, TempoPoint
+from lyrehelper.models import (
+    AnalysisResult,
+    BeatMarker,
+    ChordSegment,
+    KeySegment,
+    MonitorState,
+    NoteEvent,
+    TempoPoint,
+)
 from lyrehelper.pipeline import (
     AnalysisPipeline,
     _analyze_recent_notes,
     _detected_meter,
     _merge_incremental_beats,
+    _merge_incremental_chords,
+    _merge_incremental_keys,
     _merge_incremental_notes,
     _merge_incremental_tempo,
     _valid_note_window,
     _viterbi_tempo,
 )
-from lyrehelper.transcription_backend import _preferred_providers
+from lyrehelper.transcription_backend import (
+    _preferred_providers,
+    transcription_execution_device,
+)
 
 
 def empty_result(duration: float = 1.0) -> AnalysisResult:
@@ -37,6 +50,34 @@ def test_incremental_note_merge_only_replaces_unstable_context() -> None:
         (2.9, 3.2, 62),
         (3.8, 4.5, 67),
         (6.0, 7.0, 69),
+    ]
+
+
+def test_incremental_key_merge_keeps_segment_crossing_mutable_boundary() -> None:
+    existing = [KeySegment(0.0, 20.0, "C major", 0.8)]
+    updated = [
+        KeySegment(8.0, 19.0, "C major", 0.7),
+        KeySegment(19.0, 30.0, "G major", 0.9),
+    ]
+
+    merged = _merge_incremental_keys(existing, updated, 18.0, 30.0)
+
+    assert [(item.start, item.end, item.key) for item in merged] == [
+        (0.0, 19.0, "C major"),
+        (19.0, 30.0, "G major"),
+    ]
+
+
+def test_incremental_chord_merge_preserves_history_and_fills_silence() -> None:
+    existing = [ChordSegment(0.0, 20.0, "C", "C major", "I", 0.8)]
+    updated = [ChordSegment(22.0, 30.0, "G", "C major", "V", 0.9)]
+
+    merged = _merge_incremental_chords(existing, updated, 18.0, 30.0)
+
+    assert [(item.start, item.end, item.chord) for item in merged] == [
+        (0.0, 18.0, "C"),
+        (18.0, 22.0, "N"),
+        (22.0, 30.0, "G"),
     ]
 
 
@@ -65,6 +106,17 @@ def test_gpu_execution_providers_are_preferred_over_cpu() -> None:
         "DmlExecutionProvider",
         "CPUExecutionProvider",
     ]
+
+
+def test_execution_device_reports_actual_session_provider(monkeypatch) -> None:
+    class Session:
+        @staticmethod
+        def get_providers() -> list[str]:
+            return ["DmlExecutionProvider", "CPUExecutionProvider"]
+
+    monkeypatch.setattr("lyrehelper.transcription_backend._session", lambda: Session())
+
+    assert transcription_execution_device() == ("GPU · DIRECTML", True)
 
 
 def test_long_session_analysis_is_bounded_to_recent_context(monkeypatch) -> None:

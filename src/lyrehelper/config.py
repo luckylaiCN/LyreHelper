@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import sys
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
@@ -17,12 +18,19 @@ class AppConfig:
     end_silence_seconds: float = 3.0
     keep_running_in_tray: bool = True
     recording_mode: str = "auto"
+    cpu_warning_shown: bool = False
 
     @property
     def output_path(self) -> Path:
         if self.output_directory:
             return Path(os.path.expandvars(self.output_directory)).expanduser()
-        return Path.cwd() / ".LyreHelper" / "output"
+        return runtime_directory() / ".LyreHelper" / "output"
+
+
+def runtime_directory() -> Path:
+    if getattr(sys, "frozen", False):
+        return Path(sys.executable).resolve().parent
+    return Path.cwd()
 
 
 def config_path() -> Path:

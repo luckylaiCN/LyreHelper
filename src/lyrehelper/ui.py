@@ -25,6 +25,7 @@ from PySide6.QtWidgets import (
     QMenu,
     QProgressBar,
     QPushButton,
+    QScrollArea,
     QSizePolicy,
     QSystemTrayIcon,
     QStyle,
@@ -34,9 +35,10 @@ from PySide6.QtWidgets import (
 )
 
 from .audio_capture import list_output_devices
+from .analysis import TEMPO_JUMP_MIN_BPM, TEMPO_JUMP_RATIO, _tempo_jump_segments
 from .config import AppConfig
 from .history import HistoryEntry, list_history, load_history_snapshot
-from .models import AnalysisSnapshot, MonitorState
+from .models import AnalysisSnapshot, MonitorState, TempoPoint
 from .pipeline import AnalysisPipeline
 
 INK = QColor("#e7ebe9")
@@ -57,6 +59,34 @@ def _clock(seconds: float) -> str:
 def _midi_note_name(midi_note: int) -> str:
     names = ("C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B")
     return f"{names[midi_note % 12]}{midi_note // 12 - 1}"
+
+
+def _smoothed_tempo_values(
+    points: list[TempoPoint], window_seconds: float = 30.0
+) -> list[tuple[float, float]]:
+    if not points:
+        return []
+    ordered = sorted(points, key=lambda point: point.time)
+    times = np.asarray([point.time for point in ordered], dtype=float)
+    values = np.asarray([point.bpm for point in ordered], dtype=float)
+    prefix = np.concatenate(([0.0], np.cumsum(values)))
+    starts = np.searchsorted(times, times - window_seconds, side="left")
+    counts = np.arange(1, len(values) + 1) - starts
+    averages = (prefix[1:] - prefix[starts]) / np.maximum(counts, 1)
+    return [(float(time), float(value)) for time, value in zip(times, averages)]
+
+
+def _smoothed_tempo_segments(
+    points: list[TempoPoint],
+    window_seconds: float = 30.0,
+    jump_bpm: float = TEMPO_JUMP_MIN_BPM,
+    jump_ratio: float = TEMPO_JUMP_RATIO,
+) -> list[list[tuple[float, float]]]:
+    raw_segments = _tempo_jump_segments(points, jump_bpm, jump_ratio)
+    return [
+        _smoothed_tempo_values(segment, window_seconds)
+        for segment in raw_segments
+    ]
 
 
 def _tinted_icon(icon: QIcon, color: QColor, size: int = 18) -> QIcon:
@@ -371,12 +401,33 @@ class TimelineWidget(QWidget):
             x = self._x(point.time)
             y = bottom - (point.bpm - low) / (high - low) * (bottom - top)
             path.moveTo(x, y) if index == 0 else path.lineTo(x, y)
+        painter.setBrush(Qt.NoBrush)
         painter.setPen(QPen(AMBER, 2.0))
         painter.drawPath(path)
+        for smooth_segment in _smoothed_tempo_segments(self._snapshot.tempo):
+            smooth_visible = [
+                (time, bpm)
+                for time, bpm in smooth_segment
+                if self._view_start <= time <= self._view_end
+            ]
+            if not smooth_visible:
+                continue
+            smooth_path = QPainterPath()
+            for index, (time, bpm) in enumerate(smooth_visible):
+                x = self._x(time)
+                y = bottom - (bpm - low) / (high - low) * (bottom - top)
+                smooth_path.moveTo(x, y) if index == 0 else smooth_path.lineTo(x, y)
+            painter.setBrush(Qt.NoBrush)
+            painter.setPen(QPen(CYAN, 1.8))
+            painter.drawPath(smooth_path)
         painter.setPen(MUTED)
         painter.setFont(QFont("Cascadia Mono", 8))
         painter.drawText(QRectF(plot.left(), top - 18, 80, 16), f"{high:.0f} BPM")
         painter.drawText(QRectF(plot.left(), bottom + 2, 80, 16), f"{low:.0f} BPM")
+        painter.setPen(AMBER)
+        painter.drawText(QRectF(plot.right() - 112, top - 18, 48, 16), "RAW")
+        painter.setPen(CYAN)
+        painter.drawText(QRectF(plot.right() - 64, top - 18, 64, 16), "30S AVG")
 
     def _draw_beats(self, painter: QPainter, plot: QRectF) -> None:
         top = plot.top() + plot.height() * 0.72
@@ -471,9 +522,18 @@ class SummaryPanel(QFrame):
         layout.addWidget(keys_label)
         self.keys = QLabel("No stable key yet")
         self.keys.setObjectName("keyList")
-        self.keys.setWordWrap(True)
-        layout.addWidget(self.keys)
-        layout.addStretch()
+        self.keys.setAlignment(Qt.AlignTop | Qt.AlignLeft)
+        self.keys.setWordWrap(False)
+        self.keys.setTextInteractionFlags(Qt.NoTextInteraction)
+        self.keys_area = QScrollArea()
+        self.keys_area.setObjectName("keyListArea")
+        self.keys_area.setWidgetResizable(True)
+        self.keys_area.setFrameShape(QFrame.NoFrame)
+        self.keys_area.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.keys_area.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        self.keys_area.setWidget(self.keys)
+        self.keys_area.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        layout.addWidget(self.keys_area, 1)
         self.archive = QLabel("No archive created in this run")
         self.archive.setObjectName("archive")
         self.archive.setWordWrap(True)
@@ -501,7 +561,12 @@ class SummaryPanel(QFrame):
         self.score_caption.setText(f"{character}{grid}")
         self.score_bar.setValue(round(snapshot.human_score))
         if snapshot.keys:
-            self.keys.setText("\n".join(f"{item.key}  ·  {_clock(item.start)}–{_clock(item.end)}" for item in snapshot.keys[-6:]))
+            self.keys.setText(
+                "\n".join(
+                    f"{item.key}  ·  {_clock(item.start)}–{_clock(item.end)}"
+                    for item in snapshot.keys
+                )
+            )
         else:
             self.keys.setText("No stable key yet")
         if snapshot.last_archive:
@@ -512,19 +577,84 @@ class HarmonyFlow(QFrame):
     def __init__(self) -> None:
         super().__init__()
         self.setObjectName("harmonyFlow")
-        self.setFixedHeight(86)
+        self.setFixedHeight(112)
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(18, 12, 18, 12)
+        layout.setContentsMargins(18, 10, 18, 10)
+        layout.setSpacing(4)
         heading = QLabel("HARMONIC MOTION")
         heading.setObjectName("sectionTitle")
+        self.heading = heading
         self.flow = QLabel("Waiting for a harmonic phrase")
         self.flow.setObjectName("flowText")
+        self.roles = QLabel("")
+        self.roles.setObjectName("flowDetail")
         layout.addWidget(heading)
         layout.addWidget(self.flow)
+        layout.addWidget(self.roles)
 
     def set_snapshot(self, snapshot: AnalysisSnapshot) -> None:
-        items = [f"{item.chord}  {item.function}".strip() for item in snapshot.chords[-7:]]
-        self.flow.setText("   →   ".join(items) if items else "Waiting for a harmonic phrase")
+        current_time = snapshot.playhead if snapshot.playhead > 0 else snapshot.elapsed
+        current_key = next(
+            (
+                item.key
+                for item in reversed(snapshot.keys)
+                if item.start <= current_time <= item.end + 0.01
+            ),
+            snapshot.keys[-1].key if snapshot.keys else "Unknown",
+        )
+        recent = [
+            item
+            for item in snapshot.chords
+            if item.chord != "N"
+            and item.end >= max(0.0, current_time - 45.0)
+            and item.start <= current_time + 0.05
+        ]
+        compressed = []
+        for item in recent:
+            if compressed and item.chord == compressed[-1].chord and item.key == compressed[-1].key:
+                continue
+            compressed.append(item)
+        compressed = compressed[-8:]
+        self.heading.setText(f"FUNCTIONAL HARMONY · {current_key.upper()}")
+        if not compressed:
+            self.flow.setText("Melody only · no stable chord stack")
+            self.roles.setText("Key tracking remains active without inventing chord roots")
+            return
+        labels = [
+            f"{item.function} · {item.chord}" if item.function else item.chord
+            for item in compressed
+        ]
+        self.flow.setText("  →  ".join(labels))
+        roles = [_harmonic_role(item.function) for item in compressed]
+        role_chain = [role for index, role in enumerate(roles) if not index or role != roles[index - 1]]
+        cadence = _cadence_label([item.function for item in compressed])
+        detail = "  →  ".join(role_chain)
+        self.roles.setText(f"{detail}  ·  {cadence}" if cadence else detail)
+
+
+def _harmonic_role(function: str) -> str:
+    normalized = function.replace("7", "")
+    if normalized in {"I", "i", "III", "iii", "VI", "vi"}:
+        return "TONIC"
+    if normalized in {"II", "ii", "ii°", "IV", "iv"}:
+        return "PREDOMINANT"
+    if normalized in {"V", "v", "VII", "vii°"}:
+        return "DOMINANT"
+    return "CHROMATIC"
+
+
+def _cadence_label(functions: list[str]) -> str:
+    normalized = [item.replace("7", "") for item in functions if item]
+    if len(normalized) < 2:
+        return ""
+    pair = normalized[-2:]
+    if pair[0] == "V" and pair[1] in {"I", "i"}:
+        return "AUTHENTIC CADENCE"
+    if pair[0] in {"IV", "iv"} and pair[1] in {"I", "i"}:
+        return "PLAGAL CADENCE"
+    if pair[0] in {"II", "ii", "ii°", "IV", "iv"} and pair[1] == "V":
+        return "PREDOMINANT TO DOMINANT"
+    return ""
 
 
 def _current_bpm(snapshot: AnalysisSnapshot) -> float:
@@ -861,12 +991,14 @@ class MainWindow(QMainWindow):
         config: AppConfig,
         on_audio_source_changed: Callable[[str], None] | None = None,
         on_recording_mode_changed: Callable[[str], None] | None = None,
+        analysis_device: str = "CPU",
     ) -> None:
         super().__init__()
         self.pipeline = pipeline
         self.config = config
         self.on_audio_source_changed = on_audio_source_changed
         self.on_recording_mode_changed = on_recording_mode_changed
+        self.analysis_device = analysis_device
         self._allow_quit = False
         self._history_snapshot: AnalysisSnapshot | None = None
         self._history_entry: HistoryEntry | None = None
@@ -908,6 +1040,11 @@ class MainWindow(QMainWindow):
         self.device.setObjectName("device")
         self.latency = QLabel("LAG --")
         self.latency.setObjectName("latency")
+        self.compute = QLabel(self.analysis_device)
+        self.compute.setObjectName("computeDevice")
+        self.compute.setProperty(
+            "accelerated", not self.analysis_device.startswith("CPU")
+        )
         self.pulse = SignalPulse()
         header.addWidget(brand)
         header.addSpacing(24)
@@ -915,6 +1052,7 @@ class MainWindow(QMainWindow):
         header.addWidget(self.status)
         header.addWidget(self.device)
         header.addWidget(self.latency)
+        header.addWidget(self.compute)
         header.addStretch()
         self.record_group = QButtonGroup(self)
         self.record_group.setExclusive(True)
@@ -1198,6 +1336,11 @@ class MainWindow(QMainWindow):
 STYLESHEET = """
 QWidget#root { background: #0b100f; color: #e7ebe9; font-family: 'Bahnschrift'; }
 QWidget#floatingRoot { background: #0b100f; color: #e7ebe9; font-family: 'Bahnschrift'; }
+QScrollArea#keyListArea { background: transparent; border: none; }
+QScrollArea#keyListArea QWidget { background: transparent; }
+QScrollBar:vertical { background: #111816; width: 7px; margin: 0; }
+QScrollBar::handle:vertical { background: #34413e; min-height: 24px; }
+QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0; }
 QLabel#brand { color: #f2f5f3; font-family: 'Georgia'; font-size: 20px; font-weight: 700; }
 QLabel#statusDot { color: #7e8b88; font-size: 12px; }
 QLabel#statusDot[active="true"] { color: #76e6a5; }
@@ -1205,6 +1348,8 @@ QLabel#status { color: #d8dfdc; font-family: 'Cascadia Mono'; font-size: 10px; f
 QLabel#device { color: #697572; font-size: 11px; }
 QLabel#latency { color: #f1b95b; font-family: 'Cascadia Mono'; font-size: 9px; font-weight: 700; }
 QLabel#latency[alert="true"] { color: #ff6b62; }
+QLabel#computeDevice { color: #f1b95b; font-family: 'Cascadia Mono'; font-size: 9px; font-weight: 700; border: 1px solid #4a3c24; padding: 3px 6px; }
+QLabel#computeDevice[accelerated="true"] { color: #76e6a5; border-color: #244c3c; }
 QLabel#floatingScore { color: #76e6a5; font-family: 'Cascadia Mono'; font-size: 9px; font-weight: 700; padding-right: 8px; }
 QToolButton#tagButton { background: transparent; color: #d8dfdc; border: 1px solid #34413e; padding: 1px; font-family: 'Cascadia Mono'; font-size: 9px; font-weight: 700; }
 QToolButton#tagButton:hover { border-color: #8d9996; }
@@ -1221,6 +1366,7 @@ QLabel#muted { color: #899592; font-size: 11px; }
 QLabel#keyList { color: #cbd2cf; font-family: 'Cascadia Mono'; font-size: 10px; line-height: 1.6; }
 QLabel#archive { color: #63706d; font-family: 'Cascadia Mono'; font-size: 8px; border-top: 1px solid #26312f; padding-top: 12px; }
 QLabel#flowText { color: #dfe5e2; font-family: 'Georgia'; font-size: 17px; }
+QLabel#flowDetail { color: #8d9996; font-family: 'Cascadia Mono'; font-size: 9px; }
 QFrame#divider { color: #26312f; }
 QProgressBar { background: #202a28; border: none; }
 QProgressBar::chunk { background: #76e6a5; }

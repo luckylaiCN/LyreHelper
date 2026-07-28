@@ -18,9 +18,10 @@ from .analysis import (
     analyze_audio,
     analyze_note_events,
     transcribe_notes,
+    tempo_standard_deviation,
     update_performance_score,
 )
-from .config import AppConfig
+from .config import AppConfig, runtime_directory
 from .exporters import export_audio, export_session, prune_archives
 from .models import (
     AnalysisResult,
@@ -208,6 +209,138 @@ def _analyze_recent_notes(
         for item in result.keys
     ]
     return result, context_start
+
+
+def _merge_incremental_keys(
+    existing: list[KeySegment],
+    updated: list[KeySegment],
+    cutoff: float,
+    duration: float,
+) -> list[KeySegment]:
+    pieces = [
+        KeySegment(item.start, min(item.end, cutoff), item.key, item.confidence)
+        for item in existing
+        if item.start < cutoff and min(item.end, cutoff) > item.start
+    ]
+    pieces.extend(
+        KeySegment(max(item.start, cutoff), item.end, item.key, item.confidence)
+        for item in updated
+        if item.end > cutoff and item.end > max(item.start, cutoff)
+    )
+    merged: list[KeySegment] = []
+    for item in sorted(pieces, key=lambda segment: (segment.start, segment.end)):
+        start = max(0.0, item.start)
+        end = min(duration, item.end)
+        if end <= start:
+            continue
+        if not merged and start > 0.0:
+            start = 0.0
+        if merged:
+            previous = merged[-1]
+            if start > previous.end:
+                merged[-1] = KeySegment(
+                    previous.start, start, previous.key, previous.confidence
+                )
+                previous = merged[-1]
+            start = max(start, previous.end)
+            if end <= start:
+                continue
+            if item.key == previous.key and start <= previous.end + 0.05:
+                previous_duration = previous.end - previous.start
+                item_duration = end - start
+                confidence = (
+                    previous.confidence * previous_duration + item.confidence * item_duration
+                ) / max(previous_duration + item_duration, 1e-9)
+                merged[-1] = KeySegment(previous.start, end, item.key, confidence)
+                continue
+        merged.append(KeySegment(start, end, item.key, item.confidence))
+    if merged and merged[-1].end < duration:
+        last = merged[-1]
+        merged[-1] = KeySegment(last.start, duration, last.key, last.confidence)
+    return merged
+
+
+def _merge_incremental_chords(
+    existing: list[ChordSegment],
+    updated: list[ChordSegment],
+    cutoff: float,
+    duration: float,
+) -> list[ChordSegment]:
+    pieces = [
+        ChordSegment(
+            item.start,
+            min(item.end, cutoff),
+            item.chord,
+            item.key,
+            item.function,
+            item.confidence,
+        )
+        for item in existing
+        if item.start < cutoff and min(item.end, cutoff) > item.start
+    ]
+    pieces.extend(
+        ChordSegment(
+            max(item.start, cutoff),
+            item.end,
+            item.chord,
+            item.key,
+            item.function,
+            item.confidence,
+        )
+        for item in updated
+        if item.end > cutoff and item.end > max(item.start, cutoff)
+    )
+    merged: list[ChordSegment] = []
+    for item in sorted(pieces, key=lambda segment: (segment.start, segment.end)):
+        start = max(0.0, item.start)
+        end = min(duration, item.end)
+        if end <= start:
+            continue
+        if not merged and start > 0.0:
+            merged.append(ChordSegment(0.0, start, "N", item.key, "", 0.0))
+        if merged:
+            previous = merged[-1]
+            if start > previous.end:
+                merged.append(
+                    ChordSegment(previous.end, start, "N", previous.key, "", 0.0)
+                )
+                previous = merged[-1]
+            start = max(start, previous.end)
+            if end <= start:
+                continue
+            if (
+                item.chord == previous.chord
+                and item.key == previous.key
+                and start <= previous.end + 0.05
+            ):
+                previous_duration = previous.end - previous.start
+                item_duration = end - start
+                confidence = (
+                    previous.confidence * previous_duration + item.confidence * item_duration
+                ) / max(previous_duration + item_duration, 1e-9)
+                merged[-1] = ChordSegment(
+                    previous.start,
+                    end,
+                    item.chord,
+                    item.key,
+                    item.function,
+                    confidence,
+                )
+                continue
+        merged.append(
+            ChordSegment(
+                start,
+                end,
+                item.chord,
+                item.key,
+                item.function,
+                item.confidence,
+            )
+        )
+    if merged and merged[-1].end < duration:
+        last = merged[-1]
+        merged.append(ChordSegment(last.end, duration, "N", last.key, "", 0.0))
+    return merged
 
 
 def _viterbi_tempo(points: list[TempoPoint], anchor_bpm: float | None) -> list[TempoPoint]:
@@ -419,7 +552,7 @@ def _apply_tempo_summary(
     result.average_bpm = float(values.mean()) if len(values) else 0.0
     result.min_bpm = float(values.min()) if len(values) else 0.0
     result.max_bpm = float(values.max()) if len(values) else 0.0
-    result.bpm_std = float(values.std()) if len(values) else 0.0
+    result.bpm_std = tempo_standard_deviation(tempo)
     if result.bpm_std < 1e-9:
         result.bpm_std = 0.0
     if len(values) and result.max_bpm - result.min_bpm < 0.05:
@@ -487,7 +620,7 @@ class AnalysisPipeline(threading.Thread):
         local_app_data = os.environ.get("LOCALAPPDATA")
         fallback_root = Path(local_app_data) if local_app_data else Path.home() / ".lyrehelper"
         self._pending_directory = fallback_root / "LyreHelper" / "pending"
-        self._labels_directory = Path.cwd() / ".LyreHelper" / "labels"
+        self._labels_directory = runtime_directory() / ".LyreHelper" / "labels"
 
     def submit(self, block: np.ndarray) -> None:
         if self._queue.qsize() >= self._audio_backlog_limit:
@@ -871,10 +1004,12 @@ class AnalysisPipeline(threading.Thread):
         update_performance_score(result)
         beat_cutoff = max(0.0, elapsed - _INCREMENTAL_MUTABLE_SECONDS)
         segment_cutoff = max(analysis_start, beat_cutoff)
-        stable_chords = [item for item in existing_chords if item.end <= segment_cutoff]
-        stable_chords.extend(item for item in result.chords if item.end > segment_cutoff)
-        stable_keys = [item for item in existing_keys if item.end <= segment_cutoff]
-        stable_keys.extend(item for item in result.keys if item.end > segment_cutoff)
+        stable_keys = _merge_incremental_keys(
+            existing_keys, result.keys, segment_cutoff, elapsed
+        )
+        stable_chords = _merge_incremental_chords(
+            existing_chords, result.chords, segment_cutoff, elapsed
+        )
         latest_coverage = _note_coverage(
             merged_notes,
             max(0.0, elapsed - _AUTO_VALIDATION_SECONDS),
@@ -1040,12 +1175,12 @@ class AnalysisPipeline(threading.Thread):
                 analysis_start,
                 duration - _INCREMENTAL_MUTABLE_SECONDS,
             )
-            result.chords = [
-                item for item in accumulated_chords if item.end <= segment_cutoff
-            ] + [item for item in result.chords if item.end > segment_cutoff]
-            result.keys = [
-                item for item in accumulated_keys if item.end <= segment_cutoff
-            ] + [item for item in result.keys if item.end > segment_cutoff]
+            result.keys = _merge_incremental_keys(
+                accumulated_keys, result.keys, segment_cutoff, duration
+            )
+            result.chords = _merge_incremental_chords(
+                accumulated_chords, result.chords, segment_cutoff, duration
+            )
         else:
             result = analyze_audio(audio, self.config.sample_rate)
         stable_tempo = _merge_incremental_tempo(accumulated_tempo, result.tempo, duration)

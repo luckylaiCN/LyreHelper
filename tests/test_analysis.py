@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import numpy as np
+import pytest
 
 from lyrehelper.analysis import (
+    MAJOR_PROFILE,
     TEMPO_HOP,
     _beat_track,
     _chord_articulation_dynamics,
@@ -10,11 +12,14 @@ from lyrehelper.analysis import (
     _combine_mechanical_evidence,
     _correlated_timing_human_evidence,
     _grid_mechanical_evidence,
+    _key_segments,
     _repeated_tempo_levels,
     _segment_tempi_consistent,
+    tempo_standard_deviation,
     _tempo_track,
     _tempo_score_features,
     analyze_audio,
+    analyze_note_events,
     update_performance_score,
 )
 from lyrehelper.models import AnalysisResult, BeatMarker, NoteEvent, TempoPoint
@@ -47,8 +52,101 @@ def test_grid_accuracy_requires_high_precision_for_mechanical_evidence() -> None
 
 def test_mechanical_score_requires_correlated_timing_evidence() -> None:
     assert _combine_mechanical_evidence(35.0, 96.0, 47.0) == 47.0
-    assert _combine_mechanical_evidence(84.0, 86.0, 0.0) == 84.0
+    assert _combine_mechanical_evidence(84.0, 86.0, 0.0) == 0.0
     assert _combine_mechanical_evidence(2.0, 75.0, 63.0) == 63.0
+
+
+def test_monophonic_grid_fit_requires_stable_tempo_before_calling_it_mechanical() -> None:
+    beats = [BeatMarker(index * 0.5, 1.0) for index in range(41)]
+    notes = [
+        NoteEvent(index * 0.25, index * 0.25 + 0.1, 60, 261.63, "C4", 96, 1.0)
+        for index in range(1, 80)
+    ]
+    stable_tempo = [TempoPoint(float(index), 120.0, 1.0) for index in range(20)]
+    moving_values = [104.0 + index * 1.2 for index in range(20)]
+    moving_tempo = [
+        TempoPoint(float(index), bpm, 1.0)
+        for index, bpm in enumerate(moving_values)
+    ]
+    machine = AnalysisResult(
+        20.0, stable_tempo, beats, [], [], 120.0, 120.0, 120.0, 0.0,
+        0.0, 0.0, "test", notes,
+    )
+    human = AnalysisResult(
+        20.0,
+        moving_tempo,
+        beats,
+        [],
+        [],
+        float(np.mean(moving_values)),
+        min(moving_values),
+        max(moving_values),
+        float(np.std(moving_values)),
+        0.0,
+        0.0,
+        "test",
+        notes,
+    )
+
+    update_performance_score(machine)
+    update_performance_score(human)
+
+    assert machine.human_score < 5.0
+    assert human.human_score > 90.0
+
+
+def test_tempo_standard_deviation_pools_within_segment_variance() -> None:
+    first = [79.0, 81.0] * 6
+    second = [118.0, 122.0] * 6
+    points = [
+        TempoPoint(float(index), bpm, 1.0)
+        for index, bpm in enumerate(first + second)
+    ]
+
+    deviation = tempo_standard_deviation(points)
+
+    assert deviation == pytest.approx(np.sqrt(2.5))
+
+
+def test_tempo_standard_deviation_discards_short_jump_segments() -> None:
+    points = [
+        TempoPoint(float(index), bpm, 1.0)
+        for index, bpm in enumerate([90.0] * 11 + [120.0] * 3 + [90.0] * 11)
+    ]
+
+    assert tempo_standard_deviation(points) == 0.0
+
+
+def test_piecewise_constant_tempo_does_not_become_human_evidence() -> None:
+    beats = [BeatMarker(index * 0.5, 1.0) for index in range(45)]
+    notes = [
+        NoteEvent(index * 0.25, index * 0.25 + 0.1, 60, 261.63, "C4", 96, 1.0)
+        for index in range(1, 88)
+    ]
+    tempo = [
+        TempoPoint(float(index), 90.0 if index < 22 else 120.0, 1.0)
+        for index in range(44)
+    ]
+    result = AnalysisResult(
+        44.0,
+        tempo,
+        beats,
+        [],
+        [],
+        105.0,
+        90.0,
+        120.0,
+        15.0,
+        0.0,
+        0.0,
+        "test",
+        notes,
+    )
+
+    update_performance_score(result)
+
+    assert result.bpm_std == 0.0
+    assert result.human_score < 5.0
 
 
 def test_chord_onsets_capture_synchronized_machine_articulation() -> None:
@@ -231,6 +329,35 @@ def test_detects_tempo_beats_key_and_unambiguous_chord() -> None:
     detected = {note.midi_note for note in result.notes}
     assert {60, 64, 67}.issubset(detected)
     assert all(note.end > note.start and note.frequency > 0 for note in result.notes)
+
+
+def test_key_tracking_ignores_one_short_conflicting_window() -> None:
+    frame_rate = 8.0
+    chroma = np.tile(MAJOR_PROFILE / MAJOR_PROFILE.sum(), (round(48 * frame_rate), 1))
+    short_change = np.roll(MAJOR_PROFILE / MAJOR_PROFILE.sum(), 7)
+    chroma[round(20 * frame_rate) : round(24 * frame_rate)] = short_change
+
+    keys = _key_segments(chroma.astype(np.float32), frame_rate)
+
+    assert keys[0].start == 0.0
+    assert keys[-1].end == 48.0
+    assert all(left.end == right.start for left, right in zip(keys, keys[1:]))
+    assert len(keys) == 1
+    assert keys[0].key == "C major"
+
+
+def test_monophonic_melody_does_not_invent_chord_progression() -> None:
+    notes = [
+        NoteEvent(index * 0.5, index * 0.5 + 0.3, 60 + index % 8, 440.0, "note", 96, 1.0)
+        for index in range(32)
+    ]
+
+    result = analyze_note_events(notes, 16.0, 22050)
+
+    assert result.chords
+    assert {item.chord for item in result.chords} == {"N"}
+    assert result.keys[0].start == 0.0
+    assert result.keys[-1].end == 16.0
 
 
 def test_silence_has_stable_empty_result() -> None:
