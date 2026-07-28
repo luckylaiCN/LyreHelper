@@ -1,0 +1,41 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "lyrehelper"
+version = "0.1.0"
+description = "Unattended real-time tempo, beat, chord and key monitor for Windows audio output"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+  "librosa>=0.11,<0.12",
+  "mido>=1.3,<2",
+  "numpy>=1.26,<3",
+  "onnxruntime-directml>=1.20,<2; platform_system == 'Windows'",
+  "onnxruntime>=1.20,<2; platform_system != 'Windows'",
+  "PySide6>=6.7,<7",
+  "SoundCard>=0.4.3,<0.5",
+]
+
+[project.optional-dependencies]
+dev = ["mido>=1.3", "pytest>=8.2", "ruff>=0.5"]
+
+[project.scripts]
+lyrehelper = "lyrehelper.app:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+lyrehelper = ["assets/basic_pitch/*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
